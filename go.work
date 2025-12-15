@@ -1,0 +1,6 @@
+go 1.24.3
+
+use (
+	./xnb_parse
+	./xnb_parse_cli
+)
