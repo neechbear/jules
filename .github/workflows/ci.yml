@@ -1,0 +1,49 @@
+name: Go CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Set up Go
+      uses: actions/setup-go@v2
+      with:
+        go-version: 1.22
+
+    - name: Build
+      run: make build
+
+    - name: Test
+      run: make test
+
+    - name: Create Artifacts Directory
+      run: mkdir -p artifacts/images artifacts/sounds
+
+    - name: Extract Uncompressed Files
+      run: |
+        find Content/ -name "*.xnb" -print0 | while IFS= read -r -d $'\0' file; do
+          # Check the flags byte at offset 5. If it's 128 (0x80), the file is compressed.
+          if [ $(hexdump -n 1 -s 5 -e '1/1 "%d"' "$file") -eq 128 ]; then
+            continue
+          fi
+          if [[ "$file" == *Images* ]]; then
+            ./build/xnb_parse_cli "$file"
+            mv "$(basename "$file").png" artifacts/images/
+          elif [[ "$file" == *Sounds* ]]; then
+            ./build/xnb_parse_cli "$file"
+            mv "$(basename "$file").wav" artifacts/sounds/
+          fi
+        done
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v2
+      with:
+        name: extracted-files
+        path: artifacts

@@ -1,12 +1,15 @@
+// This file is a port of the LZX decoder from FNA.
+// See: https://github.com/FNA-XNA/FNA/blob/master/src/Content/LzxDecoder.cs
+
 package xnb_parse
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
 )
 
-// LZX Constants
 const (
 	LzxMinMatch            = 2
 	LzxMaxMatch            = 257
@@ -26,6 +29,15 @@ const (
 	LzxAlignedTablebits   = 7
 
 	LzxLenTableSafety = 64
+)
+
+type lzxBlockType int
+
+const (
+	lzxBlockTypeInvalid lzxBlockType = iota
+	lzxBlockTypeVerbatim
+	lzxBlockTypeAligned
+	lzxBlockTypeUncompressed
 )
 
 var (
@@ -50,243 +62,255 @@ func init() {
 	}
 }
 
+type lzxState struct {
+	r0, r1, r2    uint32
+	mainElements  uint16
+	headerRead    bool
+	blockType     lzxBlockType
+	blockLength   uint32
+	blockRemaining uint32
+	framesRead    uint32
+	intelFilesize int32
+	intelCurpos   int32
+	intelStarted  bool
 
-type BlockType int
+	pretreeTable []uint16
+	pretreeLen   []byte
+	maintreeTable []uint16
+	maintreeLen  []byte
+	lengthTable   []uint16
+	lengthLen     []byte
+	alignedTable  []uint16
+	alignedLen    []byte
 
-const (
-	BlockTypeInvalid      BlockType = 0
-	BlockTypeVerbatim     BlockType = 1
-	BlockTypeAligned      BlockType = 2
-	BlockTypeUncompressed BlockType = 3
-)
-
-type LzxState struct {
-	R0, R1, R2      uint32
-	MainElements    uint16
-	HeaderRead      bool
-	BlockType       BlockType
-	BlockLength     uint32
-	BlockRemaining  uint32
-	FramesRead      uint32
-	IntelFilesize   int32
-	IntelCurpos     int32
-	IntelStarted    bool
-
-	PretreeTable  []uint16
-	PretreeLen    []byte
-	MaintreeTable []uint16
-	MaintreeLen   []byte
-	LengthTable   []uint16
-	LengthLen     []byte
-	AlignedTable  []uint16
-	AlignedLen    []byte
-
-	Window     []byte
-	WindowSize uint32
-	WindowPosn uint32
+	window     []byte
+	windowSize uint32
+	windowPosn uint32
 }
 
 type LzxDecoder struct {
-	state *LzxState
+	state *lzxState
 }
 
 func NewLzxDecoder(window int) *LzxDecoder {
-	wndsize := uint32(1 << uint(window))
-	state := &LzxState{
-		Window:      make([]byte, wndsize),
-		WindowSize:  wndsize,
-		PretreeTable: make([]uint16, (1<<LzxPretreeTablebits)+(LzxPretreeMaxSymbols<<1)),
-		PretreeLen:   make([]byte, LzxPretreeMaxSymbols+LzxLenTableSafety),
-		MaintreeTable: make([]uint16, (1<<LzxMaintreeTablebits)+(LzxMaintreeMaxSymbols<<1)),
-		MaintreeLen:   make([]byte, LzxMaintreeMaxSymbols+LzxLenTableSafety),
-		LengthTable:   make([]uint16, (1<<LzxLengthTablebits)+(LzxLengthMaxSymbols<<1)),
-		LengthLen:     make([]byte, LzxLengthMaxSymbols+LzxLenTableSafety),
-		AlignedTable:  make([]uint16, (1<<LzxAlignedTablebits)+(LzxAlignedMaxSymbols<<1)),
-		AlignedLen:    make([]byte, LzxAlignedMaxSymbols+LzxLenTableSafety),
-	}
-	for i := range state.Window {
-		state.Window[i] = 0xDC
+	if window < 15 || window > 21 {
+		panic("Unsupported window size")
 	}
 
-	posnSlots := window << 1
+	wndsize := uint32(1 << uint(window))
+	var posnSlots int
 	if window == 20 {
 		posnSlots = 42
 	} else if window == 21 {
 		posnSlots = 50
+	} else {
+		posnSlots = window << 1
 	}
 
-	state.R0, state.R1, state.R2 = 1, 1, 1
-	state.MainElements = LzxNumChars + uint16(posnSlots<<3)
-
-	for i := 0; i < LzxMaintreeMaxSymbols; i++ {
-		state.MaintreeLen[i] = 0
+	state := &lzxState{
+		window:        make([]byte, wndsize),
+		windowSize:    wndsize,
+		r0:            1,
+		r1:            1,
+		r2:            1,
+		mainElements:  LzxNumChars + uint16(posnSlots<<3),
+		pretreeTable:  make([]uint16, (1<<LzxPretreeTablebits)+(LzxPretreeMaxSymbols<<1)),
+		pretreeLen:    make([]byte, LzxPretreeMaxSymbols+LzxLenTableSafety),
+		maintreeTable: make([]uint16, (1<<LzxMaintreeTablebits)+(LzxMaintreeMaxSymbols<<1)),
+		maintreeLen:   make([]byte, LzxMaintreeMaxSymbols+LzxLenTableSafety),
+		lengthTable:   make([]uint16, (1<<LzxLengthTablebits)+(LzxLengthMaxSymbols<<1)),
+		lengthLen:     make([]byte, LzxLengthMaxSymbols+LzxLenTableSafety),
+		alignedTable:  make([]uint16, (1<<LzxAlignedTablebits)+(LzxAlignedMaxSymbols<<1)),
+		alignedLen:    make([]byte, LzxAlignedMaxSymbols+LzxLenTableSafety),
 	}
-	for i := 0; i < LzxLengthMaxSymbols; i++ {
-		state.LengthLen[i] = 0
+
+	for i := range state.window {
+		state.window[i] = 0xDC
+	}
+	for i := range state.maintreeLen {
+		state.maintreeLen[i] = 0
+	}
+	for i := range state.lengthLen {
+		state.lengthLen[i] = 0
 	}
 
 	return &LzxDecoder{state: state}
 }
 
-func (d *LzxDecoder) Decompress(in io.Reader, inLen int, out io.Writer, outLen int) error {
-	bitbuf := NewBitBuffer(in)
+func (d *LzxDecoder) Decompress(in io.Reader, inLen int, out *bytes.Buffer, outLen int) error {
+	s := d.state
+	bitbuf := newBitBuffer(in)
+
 	togo := outLen
 
+	if !s.headerRead {
+		intel, err := bitbuf.readBits(1)
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if intel != 0 {
+			i, err := bitbuf.readBits(16)
+			if err != nil && err != io.EOF {
+				return err
+			}
+			j, err := bitbuf.readBits(16)
+			if err != nil && err != io.EOF {
+				return err
+			}
+			s.intelFilesize = int32((i << 16) | j)
+		}
+		s.headerRead = true
+	}
+
 	for togo > 0 {
-		if d.state.BlockRemaining == 0 {
-			if d.state.BlockType == BlockTypeUncompressed {
-				if (d.state.BlockLength & 1) == 1 {
-					// Realign bitstream to word
-					bitbuf.InitBitStream()
+		if s.blockRemaining == 0 {
+			if s.blockType == lzxBlockTypeUncompressed {
+				if (s.blockLength & 1) != 0 {
+					bitbuf.stream.Read(make([]byte, 1))
 				}
+				bitbuf.initBitStream()
 			}
 
-			blockType, err := bitbuf.ReadBits(3)
+			blockType, err := bitbuf.readBits(3)
 			if err != nil {
 				return err
 			}
-			d.state.BlockType = BlockType(blockType)
+			s.blockType = lzxBlockType(blockType)
 
-			b, err := bitbuf.ReadBits(16)
+			b, err := bitbuf.readBits(16)
 			if err != nil {
 				return err
 			}
-			c, err := bitbuf.ReadBits(8)
+			c, err := bitbuf.readBits(8)
 			if err != nil {
 				return err
 			}
-			d.state.BlockLength = (b << 8) | c
-			d.state.BlockRemaining = d.state.BlockLength
+			s.blockLength = (b << 8) | c
+			s.blockRemaining = s.blockLength
 
-			switch d.state.BlockType {
-			case BlockTypeAligned:
+			switch s.blockType {
+			case lzxBlockTypeAligned:
 				for i := 0; i < 8; i++ {
-					val, err := bitbuf.ReadBits(3)
+					val, err := bitbuf.readBits(3)
 					if err != nil {
 						return err
 					}
-					d.state.AlignedLen[i] = byte(val)
+					s.alignedLen[i] = byte(val)
 				}
-				d.MakeDecodeTable(LzxAlignedMaxSymbols, LzxAlignedTablebits, d.state.AlignedLen, d.state.AlignedTable)
+				err = makeDecodeTable(LzxAlignedMaxSymbols, LzxAlignedTablebits, s.alignedLen, s.alignedTable)
+				if err != nil {
+					return err
+				}
 				fallthrough
-			case BlockTypeVerbatim:
-				d.ReadLengths(d.state.MaintreeLen, 0, 256, bitbuf)
-				d.ReadLengths(d.state.MaintreeLen, 256, uint(d.state.MainElements), bitbuf)
-				d.MakeDecodeTable(LzxMaintreeMaxSymbols, LzxMaintreeTablebits, d.state.MaintreeLen, d.state.MaintreeTable)
-				if d.state.MaintreeLen[0xE8] != 0 {
-					d.state.IntelStarted = true
-				}
-				d.ReadLengths(d.state.LengthLen, 0, LzxNumSecondaryLengths, bitbuf)
-				d.MakeDecodeTable(LzxLengthMaxSymbols, LzxLengthTablebits, d.state.LengthLen, d.state.LengthTable)
-			case BlockTypeUncompressed:
-				d.state.IntelStarted = true
-				// Align to byte boundary
-				bitbuf.InitBitStream()
-				var r0, r1, r2 uint32
-				if err := binary.Read(bitbuf.stream, binary.LittleEndian, &r0); err != nil {
+			case lzxBlockTypeVerbatim:
+				err = d.readLengths(s.maintreeLen, 0, 256, bitbuf)
+				if err != nil {
 					return err
 				}
-				if err := binary.Read(bitbuf.stream, binary.LittleEndian, &r1); err != nil {
+				err = d.readLengths(s.maintreeLen, 256, uint32(s.mainElements), bitbuf)
+				if err != nil {
 					return err
 				}
-				if err := binary.Read(bitbuf.stream, binary.LittleEndian, &r2); err != nil {
+				err = makeDecodeTable(LzxMaintreeMaxSymbols, LzxMaintreeTablebits, s.maintreeLen, s.maintreeTable)
+				if err != nil {
 					return err
 				}
-				d.state.R0 = r0
-				d.state.R1 = r1
-				d.state.R2 = r2
+				if s.maintreeLen[0xE8] != 0 {
+					s.intelStarted = true
+				}
+				err = d.readLengths(s.lengthLen, 0, LzxNumSecondaryLengths, bitbuf)
+				if err != nil {
+					return err
+				}
+				err = makeDecodeTable(LzxLengthMaxSymbols, LzxLengthTablebits, s.lengthLen, s.lengthTable)
+				if err != nil {
+					return err
+				}
+			case lzxBlockTypeUncompressed:
+				s.intelStarted = true
+				bitbuf.initBitStream()
+				var buf [12]byte
+				_, err = io.ReadFull(bitbuf.stream, buf[:])
+				if err != nil {
+					return err
+				}
+				s.r0 = binary.LittleEndian.Uint32(buf[0:4])
+				s.r1 = binary.LittleEndian.Uint32(buf[4:8])
+				s.r2 = binary.LittleEndian.Uint32(buf[8:12])
 			default:
-				return fmt.Errorf("invalid block type")
+				return fmt.Errorf("invalid block type: %d", s.blockType)
 			}
 		}
 
-		thisRun := int(d.state.BlockRemaining)
+		thisRun := int(s.blockRemaining)
 		if thisRun > togo {
 			thisRun = togo
 		}
 		togo -= thisRun
-		d.state.BlockRemaining -= uint32(thisRun)
+		s.blockRemaining -= uint32(thisRun)
 
-		d.state.WindowPosn &= d.state.WindowSize - 1
-		if d.state.WindowPosn+uint32(thisRun) > d.state.WindowSize {
-			return fmt.Errorf("window overrun")
-		}
-
-		switch d.state.BlockType {
-		case BlockTypeVerbatim, BlockTypeAligned:
+		switch s.blockType {
+		case lzxBlockTypeVerbatim, lzxBlockTypeAligned:
 			for thisRun > 0 {
-				mainElement, err := d.ReadHuffSym(d.state.MaintreeTable, d.state.MaintreeLen, LzxMaintreeMaxSymbols, LzxMaintreeTablebits, bitbuf)
+				mainElement, err := d.readHuffSym(s.maintreeTable, s.maintreeLen, LzxMaintreeMaxSymbols, LzxMaintreeTablebits, bitbuf)
 				if err != nil {
 					return err
 				}
 				if mainElement < LzxNumChars {
-					d.state.Window[d.state.WindowPosn] = byte(mainElement)
-					d.state.WindowPosn++
+					s.window[s.windowPosn] = byte(mainElement)
+					s.windowPosn++
+					if s.windowPosn == s.windowSize {
+						s.windowPosn = 0
+					}
 					thisRun--
 				} else {
 					mainElement -= LzxNumChars
 					matchLength := mainElement & LzxNumPrimaryLengths
 					if matchLength == LzxNumPrimaryLengths {
-						lengthFooter, err := d.ReadHuffSym(d.state.LengthTable, d.state.LengthLen, LzxLengthMaxSymbols, LzxLengthTablebits, bitbuf)
+						lengthFooter, err := d.readHuffSym(s.lengthTable, s.lengthLen, LzxLengthMaxSymbols, LzxLengthTablebits, bitbuf)
 						if err != nil {
 							return err
 						}
 						matchLength += lengthFooter
 					}
 					matchLength += LzxMinMatch
-					matchOffset := uint32(mainElement >> 3)
+					matchOffset := mainElement >> 3
 
-					if d.state.BlockType == BlockTypeAligned {
-						if matchOffset > 2 {
+					if matchOffset > 2 {
+						if s.blockType == lzxBlockTypeAligned {
 							extra := extraBits[matchOffset]
-							matchOffset32 := positionBase[matchOffset] - 2
+							matchOffset = positionBase[matchOffset] - 2
 							if extra > 3 {
 								extra -= 3
-								verbatimBits, err := bitbuf.ReadBits(extra)
+								verbatimBits, err := bitbuf.readBits(extra)
 								if err != nil {
 									return err
 								}
-								matchOffset32 += verbatimBits << 3
-								alignedBits, err := d.ReadHuffSym(d.state.AlignedTable, d.state.AlignedLen, LzxAlignedMaxSymbols, LzxAlignedTablebits, bitbuf)
+								matchOffset += verbatimBits << 3
+								alignedBits, err := d.readHuffSym(s.alignedTable, s.alignedLen, LzxAlignedMaxSymbols, LzxAlignedTablebits, bitbuf)
 								if err != nil {
 									return err
 								}
-								matchOffset32 += uint32(alignedBits)
+								matchOffset += alignedBits
 							} else if extra == 3 {
-								alignedBits, err := d.ReadHuffSym(d.state.AlignedTable, d.state.AlignedLen, LzxAlignedMaxSymbols, LzxAlignedTablebits, bitbuf)
+								alignedBits, err := d.readHuffSym(s.alignedTable, s.alignedLen, LzxAlignedMaxSymbols, LzxAlignedTablebits, bitbuf)
 								if err != nil {
 									return err
 								}
-								matchOffset32 += uint32(alignedBits)
+								matchOffset += alignedBits
 							} else if extra > 0 {
-								verbatimBits, err := bitbuf.ReadBits(extra)
+								verbatimBits, err := bitbuf.readBits(extra)
 								if err != nil {
 									return err
 								}
-								matchOffset32 += verbatimBits
+								matchOffset += verbatimBits
 							} else {
-								matchOffset32 = 1
+								matchOffset = 1
 							}
-							d.state.R2 = d.state.R1
-							d.state.R1 = d.state.R0
-							d.state.R0 = matchOffset32
-							matchOffset = matchOffset32
-						} else if matchOffset == 0 {
-							matchOffset = d.state.R0
-						} else if matchOffset == 1 {
-							matchOffset = d.state.R1
-							d.state.R1 = d.state.R0
-							d.state.R0 = matchOffset
 						} else {
-							matchOffset = d.state.R2
-							d.state.R2 = d.state.R0
-							d.state.R0 = matchOffset
-						}
-					} else {
-						if matchOffset > 2 {
 							if matchOffset != 3 {
 								extra := extraBits[matchOffset]
-								verbatimBits, err := bitbuf.ReadBits(extra)
+								verbatimBits, err := bitbuf.readBits(extra)
 								if err != nil {
 									return err
 								}
@@ -294,127 +318,96 @@ func (d *LzxDecoder) Decompress(in io.Reader, inLen int, out io.Writer, outLen i
 							} else {
 								matchOffset = 1
 							}
-							d.state.R2 = d.state.R1
-							d.state.R1 = d.state.R0
-							d.state.R0 = matchOffset
-						} else if matchOffset == 0 {
-							matchOffset = d.state.R0
-						} else if matchOffset == 1 {
-							matchOffset = d.state.R1
-							d.state.R1 = d.state.R0
-							d.state.R0 = matchOffset
-						} else {
-							matchOffset = d.state.R2
-							d.state.R2 = d.state.R0
-							d.state.R0 = matchOffset
 						}
+						s.r2 = s.r1
+						s.r1 = s.r0
+						s.r0 = matchOffset
+					} else if matchOffset == 0 {
+						matchOffset = s.r0
+					} else if matchOffset == 1 {
+						matchOffset = s.r1
+						s.r1 = s.r0
+						s.r0 = matchOffset
+					} else {
+						matchOffset = s.r2
+						s.r2 = s.r0
+						s.r0 = matchOffset
 					}
-					rundest := d.state.WindowPosn
+
 					thisRun -= int(matchLength)
-					runsrc := int(rundest) - int(matchOffset)
-					if runsrc < 0 {
-						runsrc += int(d.state.WindowSize)
+
+					var runsrc uint32
+					if s.windowPosn >= matchOffset {
+						runsrc = s.windowPosn - matchOffset
+					} else {
+						runsrc = s.windowPosn + (s.windowSize - matchOffset)
 					}
-					for i := 0; i < int(matchLength); i++ {
-						d.state.Window[d.state.WindowPosn] = d.state.Window[runsrc]
-						d.state.WindowPosn++
+
+					for matchLength > 0 {
+						s.window[s.windowPosn] = s.window[runsrc]
+						s.windowPosn++
+						if s.windowPosn == s.windowSize {
+							s.windowPosn = 0
+						}
 						runsrc++
-						if runsrc == int(d.state.WindowSize) {
+						if runsrc == s.windowSize {
 							runsrc = 0
 						}
+						matchLength--
 					}
 				}
 			}
-
-		case BlockTypeUncompressed:
+		case lzxBlockTypeUncompressed:
 			data := make([]byte, thisRun)
 			_, err := io.ReadFull(bitbuf.stream, data)
 			if err != nil {
 				return err
 			}
-			copy(d.state.Window[d.state.WindowPosn:], data)
-			d.state.WindowPosn += uint32(thisRun)
-		default:
-			return fmt.Errorf("unsupported block type")
+			copy(s.window[s.windowPosn:], data)
+			s.windowPosn += uint32(thisRun)
 		}
 	}
-	startWindowPos := int(d.state.WindowPosn)
-	if startWindowPos == 0 {
-		startWindowPos = int(d.state.WindowSize)
+
+	var startWindowPos uint32
+	if s.windowPosn >= uint32(outLen) {
+		startWindowPos = s.windowPosn - uint32(outLen)
+	} else {
+		startWindowPos = s.windowSize - (uint32(outLen) - s.windowPosn)
 	}
-	startWindowPos -= outLen
-	_, err := out.Write(d.state.Window[startWindowPos : startWindowPos+outLen])
-	return err
-}
 
-type BitBuffer struct {
-	buffer   uint32
-	bitsLeft uint8
-	stream   io.Reader
-}
-
-func NewBitBuffer(stream io.Reader) *BitBuffer {
-	return &BitBuffer{stream: stream}
-}
-
-func (bb *BitBuffer) InitBitStream() {
-	bb.buffer = 0
-	bb.bitsLeft = 0
-}
-
-func (bb *BitBuffer) EnsureBits(bits uint8) error {
-	for bb.bitsLeft < bits {
-		var buf [2]byte
-		_, err := io.ReadFull(bb.stream, buf[:])
-		if err != nil {
-			return err
-		}
-		bb.buffer |= uint32(binary.LittleEndian.Uint16(buf[:])) << (16 - bb.bitsLeft)
-		bb.bitsLeft += 16
+	if startWindowPos+uint32(outLen) > s.windowSize {
+		toRead := s.windowSize - startWindowPos
+		out.Write(s.window[startWindowPos:])
+		out.Write(s.window[:outLen-int(toRead)])
+	} else {
+		out.Write(s.window[startWindowPos : startWindowPos+uint32(outLen)])
 	}
+
+	s.framesRead++
 	return nil
 }
 
-func (bb *BitBuffer) PeekBits(bits uint8) uint32 {
-	return bb.buffer >> (32 - bits)
-}
+func makeDecodeTable(nsyms uint32, nbits uint8, length []byte, table []uint16) error {
+	var sym, leaf uint16
+	var bitNum uint8 = 1
+	var fill, pos, tableMask, bitMask, nextSymbol uint32
 
-func (bb *BitBuffer) RemoveBits(bits uint8) {
-	bb.buffer <<= bits
-	bb.bitsLeft -= bits
-}
-
-func (bb *BitBuffer) ReadBits(bits uint8) (uint32, error) {
-	if bits == 0 {
-		return 0, nil
-	}
-	err := bb.EnsureBits(bits)
-	if err != nil {
-		return 0, err
-	}
-	ret := bb.PeekBits(bits)
-	bb.RemoveBits(bits)
-	return ret, nil
-}
-
-func (d *LzxDecoder) MakeDecodeTable(nsyms, nbits uint, length []byte, table []uint16) error {
-	var sym, leaf, fill, pos, tableMask, bitMask, nextSymbol uint
-	bitNum := uint(1)
+	pos = 0
 	tableMask = 1 << nbits
 	bitMask = tableMask >> 1
 	nextSymbol = bitMask
 
 	for bitNum <= nbits {
-		for sym = 0; sym < nsyms; sym++ {
-			if uint(length[sym]) == bitNum {
-				leaf = pos
+		for sym = 0; sym < uint16(nsyms); sym++ {
+			if length[sym] == bitNum {
+				leaf = uint16(pos)
 				pos += bitMask
 				if pos > tableMask {
 					return fmt.Errorf("table overrun")
 				}
 				fill = bitMask
 				for fill > 0 {
-					table[leaf] = uint16(sym)
+					table[leaf] = sym
 					leaf++
 					fill--
 				}
@@ -425,7 +418,7 @@ func (d *LzxDecoder) MakeDecodeTable(nsyms, nbits uint, length []byte, table []u
 	}
 
 	if pos != tableMask {
-		for sym = pos; sym < tableMask; sym++ {
+		for sym = uint16(pos); sym < uint16(tableMask); sym++ {
 			table[sym] = 0
 		}
 		pos <<= 16
@@ -433,22 +426,22 @@ func (d *LzxDecoder) MakeDecodeTable(nsyms, nbits uint, length []byte, table []u
 		bitMask = 1 << 15
 
 		for bitNum <= 16 {
-			for sym = 0; sym < nsyms; sym++ {
-				if uint(length[sym]) == bitNum {
-					leaf = pos >> 16
-					for fill = 0; fill < bitNum-nbits; fill++ {
+			for sym = 0; sym < uint16(nsyms); sym++ {
+				if length[sym] == bitNum {
+					leaf = uint16(pos >> 16)
+					for fill = 0; fill < uint32(bitNum-nbits); fill++ {
 						if table[leaf] == 0 {
 							table[nextSymbol<<1] = 0
 							table[(nextSymbol<<1)+1] = 0
 							table[leaf] = uint16(nextSymbol)
 							nextSymbol++
 						}
-						leaf = uint(table[leaf] << 1)
-						if ((pos >> (15 - fill)) & 1) == 1 {
+						leaf = table[leaf] << 1
+						if ((pos >> (15 - fill)) & 1) != 0 {
 							leaf++
 						}
 					}
-					table[leaf] = uint16(sym)
+					table[leaf] = sym
 					pos += bitMask
 					if pos > tableMask {
 						return fmt.Errorf("table overrun")
@@ -459,39 +452,33 @@ func (d *LzxDecoder) MakeDecodeTable(nsyms, nbits uint, length []byte, table []u
 			bitNum++
 		}
 	}
-
-	if pos == tableMask {
-		return nil
-	}
-
-	for sym = 0; sym < nsyms; sym++ {
-		if length[sym] != 0 {
-			return fmt.Errorf("erroneous table")
-		}
-	}
 	return nil
 }
 
-func (d *LzxDecoder) ReadLengths(lens []byte, first, last uint, bitbuf *BitBuffer) error {
-	for i := uint(0); i < 20; i++ {
-		y, err := bitbuf.ReadBits(4)
+func (d *LzxDecoder) readLengths(lens []byte, first, last uint32, bitbuf *bitBuffer) error {
+	var x, y uint32
+	var z int32
+
+	for x = 0; x < 20; x++ {
+		y, err := bitbuf.readBits(4)
 		if err != nil {
 			return err
 		}
-		d.state.PretreeLen[i] = byte(y)
+		d.state.pretreeLen[x] = byte(y)
 	}
-	err := d.MakeDecodeTable(LzxPretreeMaxSymbols, LzxPretreeTablebits, d.state.PretreeLen, d.state.PretreeTable)
+	err := makeDecodeTable(LzxPretreeMaxSymbols, LzxPretreeTablebits, d.state.pretreeLen, d.state.pretreeTable)
 	if err != nil {
 		return err
 	}
 
-	for x := first; x < last; {
-		z, err := d.ReadHuffSym(d.state.PretreeTable, d.state.PretreeLen, LzxPretreeMaxSymbols, LzxPretreeTablebits, bitbuf)
+	for x = first; x < last; {
+		z_uint, err := d.readHuffSym(d.state.pretreeTable, d.state.pretreeLen, LzxPretreeMaxSymbols, LzxPretreeTablebits, bitbuf)
 		if err != nil {
 			return err
 		}
+		z = int32(z_uint)
 		if z == 17 {
-			y, err := bitbuf.ReadBits(4)
+			y, err = bitbuf.readBits(4)
 			if err != nil {
 				return err
 			}
@@ -502,7 +489,7 @@ func (d *LzxDecoder) ReadLengths(lens []byte, first, last uint, bitbuf *BitBuffe
 				y--
 			}
 		} else if z == 18 {
-			y, err := bitbuf.ReadBits(5)
+			y, err = bitbuf.readBits(5)
 			if err != nil {
 				return err
 			}
@@ -513,17 +500,18 @@ func (d *LzxDecoder) ReadLengths(lens []byte, first, last uint, bitbuf *BitBuffe
 				y--
 			}
 		} else if z == 19 {
-			y, err := bitbuf.ReadBits(1)
+			y, err = bitbuf.readBits(1)
 			if err != nil {
 				return err
 			}
 			y += 4
-			z, err := d.ReadHuffSym(d.state.PretreeTable, d.state.PretreeLen, LzxPretreeMaxSymbols, LzxPretreeTablebits, bitbuf)
+			z_uint, err := d.readHuffSym(d.state.pretreeTable, d.state.pretreeLen, LzxPretreeMaxSymbols, LzxPretreeTablebits, bitbuf)
 			if err != nil {
 				return err
 			}
-			z = uint(lens[x]) - z
-			if int(z) < 0 {
+			z = int32(z_uint)
+			z = int32(lens[x]) - z
+			if z < 0 {
 				z += 17
 			}
 			for y > 0 {
@@ -532,8 +520,8 @@ func (d *LzxDecoder) ReadLengths(lens []byte, first, last uint, bitbuf *BitBuffe
 				y--
 			}
 		} else {
-			z = uint(lens[x]) - z
-			if int(z) < 0 {
+			z = int32(lens[x]) - z
+			if z < 0 {
 				z += 17
 			}
 			lens[x] = byte(z)
@@ -543,30 +531,91 @@ func (d *LzxDecoder) ReadLengths(lens []byte, first, last uint, bitbuf *BitBuffe
 	return nil
 }
 
-func (d *LzxDecoder) ReadHuffSym(table []uint16, lengths []byte, nsyms, nbits uint, bitbuf *BitBuffer) (uint, error) {
-	err := bitbuf.EnsureBits(16)
-	if err != nil {
+func (d *LzxDecoder) readHuffSym(table []uint16, lengths []byte, nsyms uint32, nbits uint8, bitbuf *bitBuffer) (uint32, error) {
+	err := bitbuf.ensureBits(16)
+	if err != nil && err != io.EOF {
 		return 0, err
 	}
-	i := uint(table[bitbuf.PeekBits(byte(nbits))])
+	i := uint32(table[bitbuf.peekBits(nbits)])
 	if i >= nsyms {
-		j := uint(1 << (32 - nbits))
+		j := uint32(1 << (32 - nbits))
 		for {
 			j >>= 1
 			i <<= 1
-			if (bitbuf.buffer & uint32(j)) != 0 {
+			if (bitbuf.buffer & j) != 0 {
 				i |= 1
 			}
 			if j == 0 {
 				return 0, fmt.Errorf("huffman table overrun")
 			}
-			i = uint(table[i])
+			i = uint32(table[i])
 			if i < nsyms {
 				break
 			}
 		}
 	}
-	j := uint(lengths[i])
-	bitbuf.RemoveBits(byte(j))
+	j := lengths[i]
+	if j > bitbuf.bitsLeft {
+		return 0, io.EOF
+	}
+	bitbuf.removeBits(j)
 	return i, nil
+}
+
+type bitBuffer struct {
+	buffer   uint32
+	bitsLeft uint8
+	stream   io.Reader
+}
+
+func newBitBuffer(stream io.Reader) *bitBuffer {
+	return &bitBuffer{stream: stream}
+}
+
+func (bb *bitBuffer) initBitStream() {
+	bb.buffer = 0
+	bb.bitsLeft = 0
+}
+
+func (bb *bitBuffer) ensureBits(bits uint8) error {
+	for bb.bitsLeft < bits {
+		var buf [2]byte
+		n, err := io.ReadFull(bb.stream, buf[:])
+		if err != nil {
+			if n == 1 {
+				bb.buffer |= uint32(buf[0]) << (32 - 8 - bb.bitsLeft)
+				bb.bitsLeft += 8
+			}
+			return err
+		}
+		val := uint32(binary.LittleEndian.Uint16(buf[:]))
+		bb.buffer |= val << (32 - 16 - bb.bitsLeft)
+		bb.bitsLeft += 16
+	}
+	return nil
+}
+
+func (bb *bitBuffer) peekBits(bits uint8) uint32 {
+	return bb.buffer >> (32 - bits)
+}
+
+func (bb *bitBuffer) removeBits(bits uint8) {
+	bb.buffer <<= bits
+	bb.bitsLeft -= bits
+}
+
+func (bb *bitBuffer) readBits(bits uint8) (uint32, error) {
+	if bits == 0 {
+		return 0, nil
+	}
+	err := bb.ensureBits(bits)
+	if err != nil && err != io.EOF {
+		return 0, err
+	}
+	if bits > bb.bitsLeft {
+		return 0, io.EOF
+	}
+	ret := bb.peekBits(bits)
+	bb.removeBits(bits)
+	return ret, nil
 }
