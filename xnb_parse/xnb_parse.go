@@ -25,11 +25,12 @@ type ContentTypeReader interface {
 
 // ContentReader is a binary reader for XNB files.
 type ContentReader struct {
-	reader      io.Reader
-	bo          binary.ByteOrder
-	Platform    byte
-	Version     byte
-	typeReaders []ContentTypeReader
+	reader          io.Reader
+	bo              binary.ByteOrder
+	Platform        byte
+	Version         byte
+	typeReaders     []ContentTypeReader
+	sharedResources []interface{}
 }
 
 var typeReaderRegistry = make(map[string]func() ContentTypeReader)
@@ -141,6 +142,15 @@ func Parse(r io.Reader) (interface{}, error) {
 		return nil, err
 	}
 
+	// Read shared resources
+	for i := 0; i < len(cr.sharedResources); i++ {
+		res, err := cr.ReadObject()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read shared resource %d: %w", i+1, err)
+		}
+		cr.sharedResources[i] = res
+	}
+
 	return asset, nil
 }
 
@@ -197,6 +207,13 @@ func (cr *ContentReader) InitializeTypeReaders() error {
 			return err
 		}
 	}
+
+	sharedResourceCount, err := cr.Read7BitEncodedInt()
+	if err != nil {
+		return fmt.Errorf("failed to read shared resource count: %w", err)
+	}
+	cr.sharedResources = make([]interface{}, sharedResourceCount)
+
 	return nil
 }
 
@@ -225,7 +242,8 @@ func prepareType(typeString string) string {
 	if strings.Contains(typeString, "PublicKeyToken") {
 		typeString = regexp.MustCompile(`(.+?),[^\]]+?$`).ReplaceAllString(typeString, "$1")
 	}
-	return typeString
+
+	return strings.Split(typeString, ",")[0]
 }
 
 // ReadObject reads an object from the stream.
@@ -242,6 +260,20 @@ func (cr *ContentReader) ReadObject() (interface{}, error) {
 	}
 	typeReader := cr.typeReaders[typeReaderIndex-1]
 	return typeReader.Read(cr)
+}
+
+func (cr *ContentReader) ReadSharedResource() (interface{}, error) {
+	index, err := cr.Read7BitEncodedInt()
+	if err != nil {
+		return nil, err
+	}
+	if index == 0 {
+		return nil, nil
+	}
+	if index > int32(len(cr.sharedResources)) {
+		return nil, fmt.Errorf("shared resource index out of bounds")
+	}
+	return cr.sharedResources[index-1], nil
 }
 
 // StringReader reads a string.
@@ -326,7 +358,11 @@ func (r *EffectReader) Read(cr *ContentReader) (interface{}, error) {
 }
 
 // ReflectiveReader is a placeholder for a reader that uses reflection.
-type ReflectiveReader struct{}
+type ReflectiveReader struct {
+	// This field is needed to mirror the structure of the C# implementation,
+	// even though it is not used in the Go implementation.
+	ElementTypeReader ContentTypeReader
+}
 
 func (r *ReflectiveReader) Read(cr *ContentReader) (interface{}, error) {
 	return nil, fmt.Errorf("ReflectiveReader not implemented")
@@ -464,7 +500,7 @@ type Vector3 struct {
 }
 
 type SpriteFont struct {
-	Texture         Texture2D
+	Texture         interface{}
 	Glyphs          []Rectangle
 	Cropping        []Rectangle
 	CharMap         []rune
@@ -477,42 +513,65 @@ type SpriteFont struct {
 type SpriteFontReader struct{}
 
 func (r *SpriteFontReader) Read(cr *ContentReader) (interface{}, error) {
-	texture, err := cr.ReadObject()
+	textureInterface, err := cr.ReadObject()
 	if err != nil {
 		return nil, err
 	}
-	glyphs, err := cr.ReadObject()
+
+	glyphsInterface, err := cr.ReadObject()
 	if err != nil {
 		return nil, err
 	}
-	cropping, err := cr.ReadObject()
+	glyphs, ok := glyphsInterface.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("could not cast glyphs to []interface{}")
+	}
+
+	croppingInterface, err := cr.ReadObject()
 	if err != nil {
 		return nil, err
 	}
-	charMap, err := cr.ReadObject()
+	cropping, ok := croppingInterface.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("could not cast cropping to []interface{}")
+	}
+
+	charMapInterface, err := cr.ReadObject()
 	if err != nil {
 		return nil, err
 	}
+	charMap, ok := charMapInterface.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("could not cast charMap to []interface{}")
+	}
+
 	var lineSpacing int32
 	err = binary.Read(cr.reader, cr.bo, &lineSpacing)
 	if err != nil {
 		return nil, err
 	}
+
 	var spacing float32
 	err = binary.Read(cr.reader, cr.bo, &spacing)
 	if err != nil {
 		return nil, err
 	}
-	kerning, err := cr.ReadObject()
+
+	kerningInterface, err := cr.ReadObject()
 	if err != nil {
 		return nil, err
 	}
+	kerning, ok := kerningInterface.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("could not cast kerning to []interface{}")
+	}
+
+	var defaultChar *rune
 	hasDefaultChar, err := cr.ReadObject()
 	if err != nil {
 		return nil, err
 	}
-	var defaultChar *rune
-	if hasDefaultChar.(bool) {
+	if val, ok := hasDefaultChar.(bool); ok && val {
 		char, err := cr.ReadObject()
 		if err != nil {
 			return nil, err
@@ -521,16 +580,31 @@ func (r *SpriteFontReader) Read(cr *ContentReader) (interface{}, error) {
 		defaultChar = &c
 	}
 
-	return SpriteFont{
-		Texture:         texture.(Texture2D),
-		Glyphs:          glyphs.([]Rectangle),
-		Cropping:        cropping.([]Rectangle),
-		CharMap:         charMap.([]rune),
+	spriteFont := SpriteFont{
+		Texture:         textureInterface,
+		Glyphs:          make([]Rectangle, len(glyphs)),
+		Cropping:        make([]Rectangle, len(cropping)),
+		CharMap:         make([]rune, len(charMap)),
 		LineSpacing:     lineSpacing,
 		Spacing:         spacing,
-		Kerning:         kerning.([]Vector3),
+		Kerning:         make([]Vector3, len(kerning)),
 		DefaultCharacter: defaultChar,
-	}, nil
+	}
+
+	for i, v := range glyphs {
+		spriteFont.Glyphs[i] = v.(Rectangle)
+	}
+	for i, v := range cropping {
+		spriteFont.Cropping[i] = v.(Rectangle)
+	}
+	for i, v := range charMap {
+		spriteFont.CharMap[i] = v.(rune)
+	}
+	for i, v := range kerning {
+		spriteFont.Kerning[i] = v.(Vector3)
+	}
+
+	return spriteFont, nil
 }
 
 
