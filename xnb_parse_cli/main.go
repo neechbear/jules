@@ -44,7 +44,7 @@ func main() {
 	case xnb_parse.SoundEffect:
 		saveWAV(filePath, v)
 	case xnb_parse.SpriteFont:
-		img, err := decodeTexture(v.Texture)
+		img, err := decodeTexture(v.Texture.(xnb_parse.Texture2D))
 		if err != nil {
 			fmt.Println("Error decoding texture:", err)
 			os.Exit(1)
